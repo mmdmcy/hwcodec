@@ -37,8 +37,9 @@ Based on the information above, there are several optimizations and changes made
 
 #### Issue
 
-* vaapi: only tested on intel with `va-driver-all`, and hevc_vaapi encoding not supported on my pc
-* remove hevc_vaapi because of possible poor quality
+* VAAPI H.264 and HEVC discovery tries CBR first, then CQP if initialization or the test frame fails. Only an encoder that produces a keyframe within the probe timeout is reported.
+* `CodecInfo.rc` records the tested mode as `["CBR"]` or `["CQP"]`. The field is omitted for other backends; older records without it still deserialize.
+* VAAPI HEVC support and CBR image quality depend on the driver and hardware; verify desktop text and detail on a supported device before relying on it.
 * amf: not tested, https://github.com/GPUOpen-LibrariesAndSDKs/AMF/issues/378
 
 ### MacOS

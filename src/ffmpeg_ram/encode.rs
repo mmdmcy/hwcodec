@@ -254,13 +254,12 @@ impl Encoder {
                     priority: Priority::Good as _,
                     ..Default::default()
                 });
-                // remove because poor quality on one of my computer
-                // codecs.push(CodecInfo {
-                //     name: "hevc_vaapi".to_owned(),
-                //     format: H265,
-                //     priority: Priority::Good as _,
-                //     ..Default::default()
-                // });
+                codecs.push(CodecInfo {
+                    name: "hevc_vaapi".to_owned(),
+                    format: H265,
+                    priority: Priority::Good as _,
+                    ..Default::default()
+                });
             }
         }
 
@@ -312,15 +311,17 @@ impl Encoder {
                 let c = EncodeContext {
                     name: codec.name.clone(),
                     mc_name: codec.mc_name.clone(),
-                    // RustDesk uses CQP for VAAPI; probing with a bitrate-based
-                    // mode would reject drivers that only support CQP.
-                    rc: if codec.name.contains("vaapi") {
-                        RateControl::RC_CQ
-                    } else {
-                        ctx.rc
-                    },
                     ..ctx
                 };
+
+                if codec.name.contains("vaapi") {
+                    if let Some(rc) = Self::probe_vaapi(&c, &yuv) {
+                        let mut codec = codec;
+                        codec.rc.push(rc);
+                        res.push(codec);
+                    }
+                    continue;
+                }
 
                 match Encoder::new(c) {
                     Ok(mut encoder) => {
@@ -328,7 +329,8 @@ impl Encoder {
                         let mut passed = false;
                         let mut last_err: Option<i32> = None;
 
-                        let max_attempts = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+                        let max_attempts = if cfg!(all(target_os = "macos", target_arch = "x86_64"))
+                        {
                             3
                         } else {
                             1
@@ -344,7 +346,8 @@ impl Encoder {
                                         if frames[0].key == 1 && elapsed < TEST_TIMEOUT_MS as _ {
                                             debug!(
                                                 "Encoder {} test passed on attempt {}",
-                                                codec.name, attempt + 1
+                                                codec.name,
+                                                attempt + 1
                                             );
                                             res.push(codec.clone());
                                             passed = true;
@@ -401,6 +404,25 @@ impl Encoder {
         res
     }
 
+    fn probe_vaapi(ctx: &EncodeContext, yuv: &[u8]) -> Option<RateControl> {
+        probe_vaapi_modes(|rc| {
+            log::debug!("Testing encoder {} with {:?}", ctx.name, rc);
+            if let Ok(mut encoder) = Self::new(EncodeContext { rc, ..ctx.clone() }) {
+                let start = std::time::Instant::now();
+                if let Ok(frames) = encoder.encode(yuv, 0) {
+                    if frames.len() == 1
+                        && frames[0].key == 1
+                        && start.elapsed().as_millis() < TEST_TIMEOUT_MS as _
+                    {
+                        return true;
+                    }
+                }
+            }
+            log::debug!("Encoder {} test failed with {:?}", ctx.name, rc);
+            false
+        })
+    }
+
     fn dummy_yuv(ctx: EncodeContext) -> Result<Vec<u8>, ()> {
         let mut yuv = vec![];
         if let Ok((_, _, len)) = ffmpeg_linesize_offset_length(
@@ -425,5 +447,50 @@ impl Drop for Encoder {
             let _ = Box::from_raw(self.frames);
             trace!("Encoder dropped");
         }
+    }
+}
+
+// Prefer a working CBR encoder; only probe CQP after the CBR encode test fails.
+fn probe_vaapi_modes(mut probe: impl FnMut(RateControl) -> bool) -> Option<RateControl> {
+    [RateControl::RC_CBR, RateControl::RC_CQ]
+        .into_iter()
+        .find(|&rc| probe(rc))
+}
+
+#[cfg(test)]
+mod vaapi_tests {
+    use super::*;
+
+    #[test]
+    fn working_cbr_does_not_probe_cqp() {
+        let mut attempted = Vec::new();
+        let mode = probe_vaapi_modes(|rc| {
+            attempted.push(rc);
+            true
+        });
+        assert_eq!(mode, Some(RateControl::RC_CBR));
+        assert_eq!(attempted, [RateControl::RC_CBR]);
+    }
+
+    #[test]
+    fn failed_cbr_falls_back_to_cqp() {
+        let mut attempted = Vec::new();
+        let mode = probe_vaapi_modes(|rc| {
+            attempted.push(rc);
+            rc == RateControl::RC_CQ
+        });
+        assert_eq!(mode, Some(RateControl::RC_CQ));
+        assert_eq!(attempted, [RateControl::RC_CBR, RateControl::RC_CQ]);
+    }
+
+    #[test]
+    fn unsupported_encoder_is_not_reported() {
+        let mut attempted = Vec::new();
+        let mode = probe_vaapi_modes(|rc| {
+            attempted.push(rc);
+            false
+        });
+        assert_eq!(mode, None);
+        assert_eq!(attempted, [RateControl::RC_CBR, RateControl::RC_CQ]);
     }
 }
